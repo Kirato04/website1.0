@@ -3,8 +3,7 @@
 # app_multivariate.py
 # 模型輸入：[load_kw, temperature, ghi]，回看 L 步 -> 一次輸出 B 步總負載
 # =========================================================
-import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -96,15 +95,44 @@ def _find_time_col(df):
     return None
 
 
+def _pv_time_col(df):
+    return "IntervalEnding" if "IntervalEnding" in df.columns else "timestamp"
+
+
+def pv_day_range(df):
+    """
+    PV 檔涵蓋哪些「預報日」。
+    IntervalEnding 從 00:15 排到隔天 00:00 才算同一天，所以先減 15 分鐘再取日期。
+    回傳 (第一天, 最後一天, 天數)，讀不到就回傳 None。
+    """
+    tc = _pv_time_col(df)
+    if tc not in df.columns:
+        return None
+    t = _to_naive_time(df[tc]).dropna()
+    if t.empty:
+        return None
+    days = pd.DatetimeIndex((t - pd.Timedelta(minutes=INTERVAL_MIN)).dt.normalize().unique()).sort_values()
+    return days[0].date(), days[-1].date(), len(days)
+
+
+@st.cache_data(show_spinner=False)
+def _scan_pv_files():
+    """掃描 repo 內所有 PV 預報檔，記錄各檔涵蓋的日期範圍。"""
+    out = []
+    for f in sorted(BASE_DIR.glob(PV_GLOB)):
+        try:
+            rng = pv_day_range(_read_csv(f))
+        except Exception:
+            rng = None
+        if rng:
+            out.append({"name": f.name, "first": rng[0], "last": rng[1], "n_days": rng[2]})
+    return out
+
+
 def _default_target_date():
-    files = sorted(BASE_DIR.glob(PV_GLOB))
-    if files:
-        m = re.search(r"(\d{8})", files[-1].name)
-        if m:
-            try:
-                return datetime.strptime(m.group(1), "%Y%m%d").date()
-            except ValueError:
-                pass
+    scanned = _scan_pv_files()
+    if scanned:
+        return scanned[-1]["first"]
     return datetime(2026, 10, 19).date()
 
 
@@ -236,16 +264,15 @@ def build_model_inputs(df_build, df_weather, latest_ts, forecast_days):
 
 
 def load_pv(uploaded_pv, target_date):
-    """回傳 (DataFrame, 檔名)。上傳優先；否則在 repo 內找檔名含目標日期的 PV 檔。"""
+    """回傳 (DataFrame, 檔名)。上傳優先；否則找「涵蓋目標日」的 PV 檔（依檔案內容判斷，不看檔名）。"""
     if uploaded_pv is not None:
         return _read_csv(uploaded_pv), uploaded_pv.name
-    files = sorted(BASE_DIR.glob(PV_GLOB))
-    if not files:
+    scanned = _scan_pv_files()
+    if not scanned:
         return None, None
-    key = target_date.strftime("%Y%m%d")
-    pick = [f for f in files if key in f.name]
-    f = pick[0] if pick else files[-1]
-    return _read_csv(f), f.name
+    pick = [x for x in scanned if x["first"] <= target_date <= x["last"]]
+    item = pick[0] if pick else scanned[-1]
+    return _read_csv(BASE_DIR / item["name"]), item["name"]
 
 
 def make_figure(df, with_pv):
@@ -292,9 +319,16 @@ else:
 st.sidebar.header("⚙️ 預測參數設定")
 forecast_days = st.sidebar.slider("預測天數 (Days)", min_value=1, max_value=7, value=1)
 target_date = st.sidebar.date_input("預測目標起始日", value=_default_target_date())
-pv_offset = st.sidebar.number_input(
-    "PV 時間平移（分鐘）", value=0, step=15,
-    help="若出現「PV 預報缺少時間點」，可試 -15 或 15，用來修正 PV 與負載預測差一格的問題。",
+time_mode = st.sidebar.radio(
+    "歷史用電的時間標記",
+    ["區間結束 (Interval Ending)，與 PV 檔相同", "區間開始 (Interval Start)"],
+    help="PV 檔的 00:15 代表 00:00~00:15 這段的結束時間。若你的用電 CSV 也是這種標記，選第一個；"
+         "若 00:00 代表這段的開始，選第二個。選錯會讓負載與 PV 差 15 分鐘。",
+)
+interval_ending = time_mode.startswith("區間結束")
+pv_kwp = st.sidebar.number_input(
+    "PV 裝置容量 (kWp)；0 = 直接用 PV 檔內的示範值", min_value=0.0, value=0.0, step=1.0,
+    help="PV 檔的示範值只有約 1 kW 的尖峰，輸入實際容量後，會用「每 kWp 出力 × 容量」重新計算。",
 )
 
 st.sidebar.markdown("---")
@@ -302,6 +336,14 @@ st.sidebar.subheader("📂 檔案上傳與來源")
 uploaded_building = st.sidebar.file_uploader("上傳歷史大樓用電 CSV", type=["csv"])
 uploaded_weather = st.sidebar.file_uploader("上傳歷史天氣 CSV（時間、氣溫、GHI）", type=["csv"])
 uploaded_pv = st.sidebar.file_uploader("上傳光伏預報 CSV", type=["csv"])
+
+if uploaded_pv is not None:
+    _rng = pv_day_range(_read_csv(uploaded_pv))
+    if _rng:
+        st.sidebar.caption(f"上傳的 PV 檔涵蓋 {_rng[0]} ~ {_rng[1]}（{_rng[2]} 天）")
+else:
+    for _item in _scan_pv_files():
+        st.sidebar.caption(f"PV 檔 {_item['name']}：{_item['first']} ~ {_item['last']}（{_item['n_days']} 天）")
 
 tab1, tab2, tab3, tab4 = st.tabs([
     "📈 24小時預測與淨負載圖表",
@@ -341,8 +383,11 @@ with tab1:
                     df_weather = None
 
                 # 3. 整理輸入並預測
-                latest_ts = (pd.Timestamp(datetime.combine(target_date, datetime.min.time()))
-                             - pd.Timedelta(minutes=INTERVAL_MIN))
+                midnight = pd.Timestamp(datetime.combine(target_date, datetime.min.time()))
+                # 區間結束：目標日 00:00 這筆屬於前一天最後一段，是最後一筆歷史資料；
+                # 預測時間 = 00:15 ~ 隔天 00:00，正好對上 PV 檔的 Step15 = 1~96。
+                latest_ts = midnight if interval_ending else midnight - pd.Timedelta(minutes=INTERVAL_MIN)
+                pv_offset = 0 if interval_ending else -INTERVAL_MIN
                 inp = build_model_inputs(df_build, df_weather, latest_ts, forecast_days)
                 st.session_state["input_notes"] = inp["notes"]
 
@@ -370,12 +415,20 @@ with tab1:
                     if pv_df is None:
                         st.session_state["warns"] = ["找不到光伏預報檔，僅顯示總負載預測。"]
                     else:
+                        rng = pv_day_range(pv_df)
+                        last_needed = target_date + timedelta(days=int(forecast_days) - 1)
+                        if rng and (target_date < rng[0] or last_needed > rng[1]):
+                            raise ValueError(
+                                f"PV 檔「{pv_name}」只涵蓋 {rng[0]} ~ {rng[1]}，"
+                                f"但你選的預測範圍是 {target_date} ~ {last_needed}。"
+                                "請縮短預測天數、改選目標日，或上傳涵蓋該日期的 PV 檔。")
                         net_df, warns = compute_net_load(
                             forecast_result=forecast_res,
                             pv_forecast=pv_df,
                             pv_col="P_PV_kW_DEMO" if "P_PV_kW_DEMO" in pv_df.columns else "P_PV_kW",
                             time_col="IntervalEnding" if "IntervalEnding" in pv_df.columns else "timestamp",
-                            pv_time_offset_min=int(pv_offset),
+                            pv_time_offset_min=pv_offset,
+                            pv_capacity_kwp=(float(pv_kwp) if pv_kwp > 0 else None),
                         )
                         st.session_state["net_df"] = net_df
                         st.session_state["warns"] = [f"使用的 PV 檔：{pv_name}"] + warns
