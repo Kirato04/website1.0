@@ -302,6 +302,119 @@ def _show_notes(notes):
 
 
 # =========================================================
+# 歷史用電統計（校園電度電費 Excel）
+# =========================================================
+CAMPUS_SHEET = "107-113各月度數費用合併"
+CAMPUS_YEARS = {2018: "107年", 2019: "108年", 2020: "109年", 2021: "110年",
+                2022: "111年", 2023: "112年", 2024: "113年"}
+CAMPUS_LOCATIONS = ["不分區 (全校總用電)", "行政區", "商學", "校友", "男", "女", "中科", "文創"]
+
+
+def _campus_year_row(df_excel, target_mco, location):
+    """取出某一年、某地點的 12 個月用電度數（找不到回傳 None）。"""
+    if location == "不分區 (全校總用電)":
+        # 例如 107年 → 找「107度數」區塊裡的「總和」列。
+        # 「107費用」區塊也有「總和」列，但那是電費，不能拿來用。
+        label = target_mco.replace("年", "度數")
+        n = len(df_excel)
+        for idx in range(n):
+            v = df_excel.iloc[idx, 0]
+            if pd.notna(v) and str(v).strip() == label:
+                for j in range(idx + 1, min(idx + 15, n)):
+                    w = df_excel.iloc[j, 0]
+                    if pd.notna(w) and str(w).strip() == "總和":
+                        vals = pd.to_numeric(
+                            pd.Series(df_excel.iloc[j, 1:13].values), errors="coerce"
+                        ).to_numpy(dtype=float)
+                        vals[vals == 0] = np.nan   # 尚未發生的月份在 Excel 裡是 0
+                        return vals
+        return None
+
+    block = None
+    for _, row in df_excel.iterrows():
+        val = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+        if target_mco in val and "度數" not in val and "費用" not in val:
+            block = target_mco
+            continue
+        elif any(y in val for y in CAMPUS_YEARS.values()) and val != target_mco:
+            block = None
+        if block == target_mco and val == location:
+            return row.iloc[1:13].values
+    return None
+
+
+def render_history_tab():
+    st.header("📈 歷史用電統計與動態趨勢分析")
+
+    with st.expander("📌 點此查看【歷史統計檔案】的規格與欄位說明", expanded=False):
+        st.markdown("""
+        * **檔案格式**：Excel 試算表（`.xlsx` 或 `.xls`）。
+        * **工作表名稱（Sheet）**：需包含各月份用電度數彙整表（例如 `107-113各月度數費用合併`）。
+        * **資料排列**：每年有「度數」與「費用」兩個區塊，區塊內有 行政區／商學／校友／男／女／中科／文創／總和 各一列，12 個月各一欄。
+        """)
+
+    file = st.file_uploader("請上傳校園電度電費 Excel 統計檔案", type=["xlsx", "xls"], key="hist_excel")
+    if file is None:
+        st.info("💡 請先上傳您的電度電費 Excel 統計檔案，即可檢視月統計與趨勢圖。")
+        return
+
+    try:
+        xl = pd.ExcelFile(file)
+        default = CAMPUS_SHEET if CAMPUS_SHEET in xl.sheet_names else xl.sheet_names[0]
+        sheet = st.selectbox("請選擇資料工作表 (Sheet)", xl.sheet_names,
+                             index=xl.sheet_names.index(default), key="hist_sheet")
+        df_excel = xl.parse(sheet, header=None)
+        st.success(f"✅ 成功讀取檔案：{file.name} (工作表: {sheet})")
+
+        c1, c2 = st.columns(2)
+        year = c1.selectbox("選擇分析西元年份", list(CAMPUS_YEARS), index=len(CAMPUS_YEARS) - 1,
+                            key="hist_year")
+        loc = c2.selectbox("選擇分析地點 / 區域 / 大樓", CAMPUS_LOCATIONS, key="hist_loc")
+        mco = CAMPUS_YEARS[year]
+        row = _campus_year_row(df_excel, mco, loc)
+    except Exception as e:
+        st.error(f"❌ 解析上傳的 Excel 檔案時發生錯誤: {e}")
+        return
+
+    if row is None:
+        st.error(f"❌ 在上傳的檔案中找不到 {year} 年 ({mco}) 對應的【{loc}】資料。")
+        return
+
+    months = pd.date_range(start=f"{year}-01-01", periods=12, freq="MS")
+    s = pd.Series(pd.to_numeric(pd.Series(row), errors="coerce").to_numpy(float), index=months).dropna()
+    if s.empty:
+        st.warning(f"⚠️ {year} 年的【{loc}】目前沒有有效的月用電數值。")
+        return
+
+    total, mean = s.sum(), s.mean()
+    peak_m, low_m = s.idxmax(), s.idxmin()
+
+    st.markdown("---")
+    st.subheader(f"📊 {year} 年 ({mco}) - 【{loc}】 用電統計摘要")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("區間總用電量", f"{total:,.2f} kWh")
+    m2.metric("每月平均用電", f"{mean:,.2f} kWh")
+    m3.metric("用電最高月份", f"{peak_m:%Y-%m}", f"{s.max():,.2f} kWh")
+    m4.metric("用電最低月份", f"{low_m:%Y-%m}", f"{s.min():,.2f} kWh")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines+markers", name=f"{loc} Load",
+                             line=dict(color="forestgreen", width=3), marker=dict(size=9)))
+    fig.add_annotation(x=peak_m, y=s.max(), text=f"Peak: {s.max():,.0f} kWh", showarrow=True,
+                       arrowhead=2, ax=0, ay=-40, font=dict(color="crimson", size=13))
+    fig.update_layout(
+        title=f"{year} {loc} Monthly Electricity Load Analysis",
+        xaxis=dict(title=f"Month ({year})", tickmode="array", tickvals=list(s.index),
+                   ticktext=[m.strftime("%b") for m in s.index]),
+        yaxis_title="Power Consumption (kWh / Month)",
+        template="plotly_white",
+        height=450,
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# =========================================================
 # 頁面標題與模型狀態
 # =========================================================
 st.title("⚡ 微電網 EMS 智慧負載預測與淨負載對接平台")
@@ -345,12 +458,19 @@ else:
     for _item in _scan_pv_files():
         st.sidebar.caption(f"PV 檔 {_item['name']}：{_item['first']} ~ {_item['last']}（{_item['n_days']} 天）")
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📈 24小時預測與淨負載圖表",
+tab_hist, tab1, tab2, tab3, tab4 = st.tabs([
+    "📈 歷史用電統計與趨勢分析",
+    "🚀 24小時預測與淨負載圖表",
     "📊 批次數據預覽與下載",
     "🧪 系統防禦與稽核統計",
     "📖 說明與規格說明",
 ])
+
+# =========================================================
+# 分頁 0：歷史用電統計
+# =========================================================
+with tab_hist:
+    render_history_tab()
 
 # =========================================================
 # 分頁 1：預測
