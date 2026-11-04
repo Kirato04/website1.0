@@ -1,0 +1,12 @@
+streamlit
+pandas
+numpy
+matplotlib
+openpyxl
+tensorflow
+keras
+scikit-learn
+joblib
+pytz
+python-dateutil
+statsmodels
