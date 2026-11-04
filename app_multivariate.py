@@ -243,6 +243,38 @@ def _prepare_weather(df):
     return w
 
 
+def _to_15min(all_d, interval_ending):
+    """
+    把任意取樣間隔（例如每分鐘）的用電資料彙整成 15 分鐘平均，回傳 (新表, 說明文字或 None)。
+    - 間隔小於 15 分鐘：每 15 分鐘取平均（功率 kW 用平均才合理）。
+      區間結束：(00:00, 00:15] 的平均標成 00:15；區間開始：[00:00, 00:15) 的平均標成 00:00。
+      樣本不到一半的殘缺區間會被捨棄。
+    - 間隔大於 15 分鐘：用時間內插補成 15 分鐘。
+    """
+    step = all_d.index.to_series().diff().dropna().median()
+    quarter = pd.Timedelta(minutes=INTERVAL_MIN)
+    if pd.isna(step) or abs(step - quarter) <= pd.Timedelta(seconds=1):
+        return all_d, None
+
+    num = all_d.apply(pd.to_numeric, errors="coerce")
+    num = num.loc[:, num.notna().any()]
+    rule = f"{INTERVAL_MIN}min"
+    if step < quarter:
+        kw = dict(label="right", closed="right") if interval_ending else dict(label="left", closed="left")
+        rs = num.resample(rule, **kw)
+        out = rs.mean()
+        cnt = rs.count().max(axis=1)
+        out = out[cnt >= 0.5 * (quarter / step)]
+        how = "平均"
+    else:
+        out = num.resample(rule).mean().interpolate(method="time", limit=int(round(step / quarter)))
+        out = out.dropna(how="all")
+        how = "內插"
+    mins = step.total_seconds() / 60
+    return out, (f"用電資料原本約每 {mins:g} 分鐘一筆，已自動{how}成每 {INTERVAL_MIN} 分鐘一筆"
+                 f"（{len(all_d)} → {len(out)} 筆）。")
+
+
 def build_model_inputs(df_build, df_weather, latest_ts, forecast_days, target_day,
                        pv_df=None, interval_ending=True, allow_demo=True):
     """
@@ -287,6 +319,9 @@ def build_model_inputs(df_build, df_weather, latest_ts, forecast_days, target_da
             .drop_duplicates("_t")
             .set_index("_t")
         )
+        all_d, resample_note = _to_15min(all_d, interval_ending)
+        if resample_note:
+            notes.append(("info", resample_note))
         d = all_d[all_d.index <= latest_ts]
         gap = (latest_ts - d.index[-1]) if len(d) else None
         too_short = len(d) < L
