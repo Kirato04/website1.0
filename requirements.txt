@@ -1,7 +1,7 @@
 streamlit
 pandas
 numpy
-matplotlib
+plotly
 openpyxl
 tensorflow
 keras
@@ -9,4 +9,3 @@ scikit-learn
 joblib
 pytz
 python-dateutil
-statsmodels
